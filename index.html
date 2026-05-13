@@ -628,6 +628,8 @@ body::before {
     </div>
     <div class="live-dot"></div>
     <div class="clock-sm" id="clock">--:--:--</div>
+    <button id="privacy-btn" onclick="togglePrivacy()" title="Toggle number privacy"
+      style="background:none;border:1px solid var(--border);border-radius:6px;padding:4px 9px;cursor:pointer;font-size:14px;line-height:1;color:var(--muted);transition:all .2s">👁</button>
     <div class="theme-btn" onclick="toggleTheme()" title="Toggle theme"></div>
   </div>
 </div>
@@ -2513,6 +2515,110 @@ function startCountdown(seconds) {
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  BOOT SEQUENCE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  PRIVACY MASK — toggle * on all financial numbers
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+let privacyOn = false;
+
+// IDs of every element whose text should be masked
+const PRIVACY_IDS = [
+  // Hero bar
+  'global-total','global-us','global-in-inr','global-in-usd','g-us-ret','g-in-ret','g-inr-rate',
+  // KPI cards
+  'kpi-acct-val','kpi-acct-sub','kpi-total-ret','kpi-ret-sub','kpi-period-pl','kpi-pl-sub',
+  // Holdings table — masked per row via class
+  // Monthly perf — masked via class
+  // India totals
+  'india-total-val-inr','india-total-val-usd','india-total-unreal',
+  // US Holdings footer
+  'hold-total-val','hold-total-unreal','hold-total-cost',
+];
+
+// Store originals so we can restore
+const _privOrig = {};
+
+function _maskEl(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (!_privOrig[id]) _privOrig[id] = el.innerHTML;
+  // Replace anything that looks like a number/currency with ****
+  el.innerHTML = el.innerHTML
+    .replace(/(\$|₹|﷼|QAR\s?)[\d,\.]+/g, '$1 ****')
+    .replace(/[+\-]?\d[\d,\.]*%/g, '**%')
+    .replace(/[+\-]?\d[\d,\.]{2,}/g, '****');
+}
+
+function _unmaskEl(id) {
+  const el = document.getElementById(id);
+  if (el && _privOrig[id]) el.innerHTML = _privOrig[id];
+}
+
+// Mask cells in a table body (holdings rows)
+function _maskTableBody(tbodyId) {
+  const tbody = document.getElementById(tbodyId);
+  if (!tbody) return;
+  if (!_privOrig[tbodyId]) _privOrig[tbodyId] = tbody.innerHTML;
+  tbody.querySelectorAll('td.ra, td[data-val]').forEach(td => {
+    if (!td.dataset.orig) td.dataset.orig = td.innerHTML;
+    td.innerHTML = td.innerHTML
+      .replace(/(\$|₹)[\d,\.]+/g, '$1 ****')
+      .replace(/[+\-]?\d[\d,\.]*%/g, '**%')
+      .replace(/[+\-]?\d[\d,\.]{3,}/g, '****');
+  });
+}
+
+function _unmaskTableBody(tbodyId) {
+  const tbody = document.getElementById(tbodyId);
+  if (tbody && _privOrig[tbodyId]) tbody.innerHTML = _privOrig[tbodyId];
+}
+
+// Mask profit bars Y-axis labels
+function _maskBars(on) {
+  document.querySelectorAll('.mperf-label, .mperf-pct, .bar-val, .bar-label, .bar-pct').forEach(el => {
+    if (on) {
+      if (!el.dataset.orig) el.dataset.orig = el.textContent;
+      if (/[\d\$₹%]/.test(el.textContent)) el.textContent = el.textContent.replace(/[+\-]?\d[\d,\.]*%?/g, '**');
+    } else {
+      if (el.dataset.orig) el.textContent = el.dataset.orig;
+    }
+  });
+}
+
+function togglePrivacy() {
+  privacyOn = !privacyOn;
+  const btn = document.getElementById('privacy-btn');
+  btn.textContent = privacyOn ? '🙈' : '👁';
+  btn.style.borderColor = privacyOn ? 'var(--R)' : 'var(--border)';
+  btn.style.color       = privacyOn ? 'var(--R)' : 'var(--muted)';
+
+  if (privacyOn) {
+    PRIVACY_IDS.forEach(_maskEl);
+    _maskTableBody('holdings-body');
+    _maskTableBody('india-holdings-body');
+    _maskBars(true);
+    // Mask kpi-acct-sub children spans inline
+    document.querySelectorAll('.kpi-big, .kpi-sub, .global-bar-val, .mperf-bar-label').forEach(el => {
+      if (!el.dataset.orig) el.dataset.orig = el.innerHTML;
+      el.innerHTML = el.innerHTML
+        .replace(/(\$|₹|﷼)[\s]?[\d,\.]+/g, '$1****')
+        .replace(/[+\-]?\d[\d,\.]*%/g, '**%')
+        .replace(/[+\-]?\d[\d,\.]{3,}/g, '****');
+    });
+  } else {
+    PRIVACY_IDS.forEach(_unmaskEl);
+    _unmaskTableBody('holdings-body');
+    _unmaskTableBody('india-holdings-body');
+    _maskBars(false);
+    document.querySelectorAll('.kpi-big, .kpi-sub, .global-bar-val, .mperf-bar-label').forEach(el => {
+      if (el.dataset.orig) el.innerHTML = el.dataset.orig;
+    });
+    // Re-render live values so nothing is stale after unmask
+    renderUS();
+    renderIndia(currentBrokerFilter);
+    renderProfitBars(computeUS().rows);
+  }
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  SIGNALS ENGINE — 9-component model + pre-entry screener
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
