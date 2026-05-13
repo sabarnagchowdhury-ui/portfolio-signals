@@ -2964,6 +2964,10 @@ async function runScreener() {
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 (async function boot() {
+  // Deep-link via URL hash: index.html#signals / #hold / #india etc.
+  const hashTab = location.hash.replace('#','');
+  if (['viz','hold','india','tx','signals'].includes(hashTab)) switchTab(hashTab);
+
   // 1. Immediately render with last-known prices (instant UI)
   updateClock();
   updateMarketStatus();
