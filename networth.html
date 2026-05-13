@@ -1,0 +1,1291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Sabarna · DBG Wealth Tracker</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #060d1a; min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── CONSTANTS ──────────────────────────────────────────────────────────────
+const GITHUB_RAW = "https://raw.githubusercontent.com/sabarnagchowdhury-ui/portfolio-dashboard/main/data/processed";
+const GOLD_API   = "https://api.metals.live/v1/spot/gold";
+const FX_API     = "https://open.er-api.com/v6/latest/USD"; // free, no key needed
+const GH_CFG_KEY = "sabarna_gh_cfg";
+const ghApiUrl = (user, repo, file = "wealth_data.json") =>
+  `https://api.github.com/repos/${user}/${repo}/contents/${file}`;
+const ghHeaders = (token) => ({
+  "Authorization": `token ${token}`,
+  "Accept": "application/vnd.github.v3+json",
+  "Content-Type": "application/json",
+});
+
+// Fallback static rates (used if live fetch fails)
+const FALLBACK = { USD_INR: 85.5, QAR_INR: 23.5, USD_QAR: 3.64 };
+
+const TARGETS = [{ label: "₹2.5 Cr", value: 25000000 }, { label: "₹5 Cr", value: 50000000 }];
+
+const CONSERVATIVE_SCHEDULE = [
+  { month: "May 2026",  nw: 14700000 },
+  { month: "Jun 2026",  nw: 15100000 },
+  { month: "Jul 2026",  nw: 15400000 },
+  { month: "Aug 2026",  nw: 15800000 },
+  { month: "Sep 2026",  nw: 16200000 },
+  { month: "Oct 2026",  nw: 16700000 },
+  { month: "Nov 2026",  nw: 17100000 },
+  { month: "Dec 2026",  nw: 17600000 },
+  { month: "Jan 2027",  nw: 18100000 },
+  { month: "Feb 2027",  nw: 18600000 },
+  { month: "Mar 2027",  nw: 19100000 },
+];
+
+const FORECAST = [
+  { year: "2026", conservative: 14700000, base: 14700000,  optimistic: 14700000 },
+  { year: "2027", conservative: 17800000, base: 18500000,  optimistic: 19500000 },
+  { year: "2028", conservative: 21800000, base: 23100000,  optimistic: 25200000 },
+  { year: "2029", conservative: 26500000, base: 28700000,  optimistic: 32100000 },
+  { year: "2030", conservative: 32000000, base: 35200000,  optimistic: 40500000 },
+  { year: "2031", conservative: 38200000, base: 40900000,  optimistic: 51000000 },
+];
+
+const STORAGE_KEY = "sabarna_nw_v3";
+
+const DEFAULT_MANUAL = {
+  // ── Qatar Banks (QAR) ──
+  hsbcSavings:         0,
+  hsbcCurrent:         0,
+  dohaBank_sav:        0,
+  dohaBank_cur:        0,
+  // ── India Banks (INR) ──
+  yesNRE:              0,
+  yesNRO:              0,
+  yesNROInvest:        0,
+  idfcNRE:             0,
+  indusNRE:            0,
+  indusNREPIS:         0,
+  indusNRO:            0,
+  canaraInr:           0,
+  iobNRE:              0,
+  sbiNRO:              0,
+  axisNRE:             0,
+  idfcRI:              0,
+  hsbc_india:          0,
+  tala:                1100000,
+  // ── Liabilities ──
+  apartmentLoan:       4118072,
+  carLoan:             6370000,
+  qatarAirwaysCC:      0,
+  luluCC:              0,
+  // ── Assets ──
+  foCorpus:            7000000,
+  landCruiser:         0,
+  goldJewellery:       4500000,
+  malabarGold:         600000,
+  apartment:           6500000,
+  gratuity:            1970000,
+  // ── Indian MF (INR) ──
+  mfPrincipal:         0,   // total invested principal
+  mfCurrentValue:      0,   // current NAV-based value
+  // ── US Stocks principal (USD) — current value comes from GitHub ──
+  usStocksPrincipalUSD: 0,
+  // ── India Stocks principal (INR) — current value from GitHub ──
+  indiaStocksPrincipal: 0,
+  history: [],
+};
+
+// ── HELPERS ────────────────────────────────────────────────────────────────
+const fmt    = (n, dec = 0) => new Intl.NumberFormat("en-IN", { maximumFractionDigits: dec, minimumFractionDigits: dec }).format(n);
+const fmtCr  = n => { const cr = n / 10000000; return cr >= 1 ? `₹${cr.toFixed(2)} Cr` : `₹${fmt(n / 100000, 1)}L`; };
+const fmtUSD = (n, rates) => `$${fmt(n / rates.USD_INR, 0)}`;
+const fmtQAR = (n, rates) => `QAR ${fmt(n / rates.QAR_INR, 0)}`;
+const pct    = (val, total) => total ? Math.min(100, (val / total) * 100) : 0;
+const nowStr = () => new Date().toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+const todayKey = () => new Date().toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+
+function inrTo(valueINR, currency, rates) {
+  if (currency === "INR") return fmtCr(valueINR);
+  if (currency === "USD") return `$${fmt(valueINR / rates.USD_INR, 0)}`;
+  if (currency === "QAR") return `QAR ${fmt(valueINR / rates.QAR_INR, 0)}`;
+  return fmtCr(valueINR);
+}
+
+// PnL badge helper
+function pnlInfo(principal, current) {
+  if (!principal || principal === 0) return null;
+  const pnl = current - principal;
+  const pct = ((pnl / principal) * 100).toFixed(1);
+  return { pnl, pct, color: pnl >= 0 ? "#34d399" : "#f87171", sign: pnl >= 0 ? "+" : "" };
+}
+
+function useStorage() {
+  const load = () => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? { ...DEFAULT_MANUAL, ...JSON.parse(raw) } : { ...DEFAULT_MANUAL };
+    } catch { return { ...DEFAULT_MANUAL }; }
+  };
+  const [data, setData] = useState(load);
+  const save = useCallback(d => { setData(d); try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch {} }, []);
+  return [data, save];
+}
+
+// ── MINI COMPONENTS ────────────────────────────────────────────────────────
+function Card({ children, className = "" }) {
+  return <div className={`card ${className}`}>{children}</div>;
+}
+
+function ProgressBar({ value, max, color = "#f0b429", label, sub }) {
+  const p = pct(value, max);
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ fontSize: 12, color: "#a0aec0", fontFamily: "DM Sans" }}>{label}</span>
+        <span style={{ fontSize: 12, color: "#e2e8f0", fontFamily: "DM Mono" }}>{sub}</span>
+      </div>
+      <div style={{ background: "#1a2234", borderRadius: 6, height: 8, overflow: "hidden" }}>
+        <div style={{ width: `${p}%`, height: "100%", background: `linear-gradient(90deg, ${color}88, ${color})`, borderRadius: 6, transition: "width 1s ease" }} />
+      </div>
+      <div style={{ textAlign: "right", fontSize: 10, color: color, marginTop: 2, fontFamily: "DM Mono" }}>{p.toFixed(1)}%</div>
+    </div>
+  );
+}
+
+function StatBox({ label, value, sub, color = "#f0b429", small = false }) {
+  return (
+    <div style={{ background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 10, padding: "14px 16px" }}>
+      <div style={{ fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, fontFamily: "DM Sans", marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: small ? 18 : 22, fontWeight: 700, color, fontFamily: "DM Mono", lineHeight: 1.1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: "#475569", marginTop: 4, fontFamily: "DM Sans" }}>{sub}</div>}
+    </div>
+  );
+}
+
+function DeltaBadge({ d }) {
+  if (!d) return <span style={{ fontSize: 9, color: "#374151", fontFamily: "DM Mono" }}>— first entry</span>;
+  return (
+    <span style={{ fontSize: 10, fontFamily: "DM Mono", color: d.color, background: d.color + "18", borderRadius: 4, padding: "2px 6px", marginLeft: 6 }}>
+      {d.text}
+    </span>
+  );
+}
+
+function SectionTitle({ n, title, icon }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18 }}>
+      <div style={{ width: 30, height: 30, borderRadius: 8, background: "linear-gradient(135deg,#1e3a5f,#0f2040)", border: "1px solid #2d4a6e", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>{icon}</div>
+      <div>
+        <div style={{ fontSize: 10, color: "#f0b429", textTransform: "uppercase", letterSpacing: 2, fontFamily: "DM Sans" }}>Section {n}</div>
+        <div style={{ fontSize: 18, fontWeight: 700, color: "#e2e8f0", fontFamily: "Playfair Display" }}>{title}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── PRINCIPAL / CURRENT VALUE TOGGLE ──────────────────────────────────────
+function ViewToggle({ view, setView }) {
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 20, padding: "3px 5px", gap: 3 }}>
+      {[["principal", "Principal"], ["current", "Incl. P&L"]].map(([val, label]) => (
+        <button key={val} onClick={() => setView(val)}
+          style={{
+            background: view === val ? "linear-gradient(135deg,#3b82f6,#1d4ed8)" : "transparent",
+            border: "none", borderRadius: 14, padding: "4px 10px",
+            color: view === val ? "#fff" : "#475569",
+            fontSize: 11, fontFamily: "DM Mono", fontWeight: 700, cursor: "pointer",
+            transition: "all 0.2s"
+          }}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── CURRENCY TOGGLE ────────────────────────────────────────────────────────
+function CurrencyToggle({ currency, setCurrency, rates }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 4, background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 20, padding: "3px 6px" }}>
+      {["INR", "USD", "QAR"].map(c => (
+        <button key={c} onClick={() => setCurrency(c)}
+          style={{
+            background: currency === c ? "linear-gradient(135deg,#f0b429,#d97706)" : "transparent",
+            border: "none", borderRadius: 14, padding: "4px 10px",
+            color: currency === c ? "#0d1a2d" : "#475569",
+            fontSize: 11, fontFamily: "DM Mono", fontWeight: 700, cursor: "pointer",
+            transition: "all 0.2s"
+          }}>
+          {c === "INR" ? "₹" : c === "USD" ? "$" : "QAR"}
+        </button>
+      ))}
+      {rates._live && (
+        <span style={{ fontSize: 8, color: "#1e3a5f", fontFamily: "DM Mono", marginLeft: 2 }}>LIVE</span>
+      )}
+    </div>
+  );
+}
+
+// ── INVESTMENT CARD — shows principal vs current with PnL ─────────────────
+function InvestmentCard({ label, principalINR, currentINR, principalUSD, currentUSD, view, currency, rates, note, color, loading }) {
+  const isUSD = principalUSD != null;
+  const principal = isUSD ? (principalUSD * rates.USD_INR) : principalINR;
+  const current   = isUSD ? (currentUSD  * rates.USD_INR) : currentINR;
+  const displayVal = view === "principal" ? principal : current;
+  const info = pnlInfo(principal, current);
+
+  return (
+    <Card>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "#cbd5e1", fontFamily: "DM Sans" }}>{label}</div>
+          <div style={{ fontSize: 10, color: "#374151", marginTop: 2, fontFamily: "DM Sans" }}>
+            {loading ? "⏳ Fetching..." : note}
+          </div>
+          {/* Principal pill */}
+          {view === "current" && info && (
+            <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              <span style={{ fontSize: 9, color: "#475569", background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 4, padding: "2px 6px", fontFamily: "DM Mono" }}>
+                Cost: {isUSD ? `$${fmt(principalUSD, 0)}` : fmtCr(principal)}
+              </span>
+              <span style={{ fontSize: 10, color: info.color, background: info.color + "15", borderRadius: 4, padding: "2px 6px", fontFamily: "DM Mono", fontWeight: 700 }}>
+                {info.sign}{info.pct}% · {isUSD ? `$${fmt(Math.abs(info.pnl) / rates.USD_INR, 0)}` : fmtCr(Math.abs(info.pnl))}
+              </span>
+            </div>
+          )}
+          {view === "principal" && info && (
+            <div style={{ marginTop: 6 }}>
+              <span style={{ fontSize: 9, color: "#374151", background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 4, padding: "2px 6px", fontFamily: "DM Mono" }}>
+                Current: {isUSD ? `$${fmt(currentUSD, 0)}` : fmtCr(current)} (tap P&L to see)
+              </span>
+            </div>
+          )}
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: view === "current" && info ? info.color : color, fontFamily: "DM Mono" }}>
+            {inrTo(displayVal, currency, rates)}
+          </div>
+          {currency !== "INR" && <div style={{ fontSize: 10, color: "#475569", fontFamily: "DM Mono" }}>{fmtCr(displayVal)}</div>}
+          {isUSD && (
+            <div style={{ fontSize: 9, color: "#374151", fontFamily: "DM Mono" }}>
+              {view === "principal" ? `$${fmt(principalUSD, 0)}` : `$${fmt(currentUSD, 0)}`}
+            </div>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+// ── SIMPLE LINE CHART ──────────────────────────────────────────────────────
+function LineChart({ data, keys, colors, labels, height = 160 }) {
+  if (!data || data.length < 2) return (
+    <div style={{ textAlign: "center", color: "#374151", fontSize: 11, fontFamily: "DM Sans", padding: 20 }}>
+      Need at least 2 data points to chart
+    </div>
+  );
+  const allVals = data.flatMap(d => keys.map(k => d[k]).filter(v => v != null));
+  const min = Math.min(...allVals) * 0.95;
+  const max = Math.max(...allVals) * 1.02;
+  const W = 520, H = height;
+  const xStep = W / (data.length - 1);
+  const yScale = v => H - ((v - min) / (max - min)) * H;
+  const path = (key) => data.map((d, i) => `${i === 0 ? "M" : "L"}${i * xStep},${yScale(d[key])}`).join(" ");
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <svg viewBox={`0 0 ${W} ${H + 30}`} style={{ width: "100%", minWidth: 300 }}>
+        {[0.25, 0.5, 0.75, 1].map(f => (
+          <line key={f} x1={0} y1={yScale(min + (max - min) * f)} x2={W} y2={yScale(min + (max - min) * f)}
+            stroke="#1e2d45" strokeWidth={1} strokeDasharray="4,4" />
+        ))}
+        {keys.map((k, ki) => (
+          <g key={k}>
+            <path d={path(k)} fill="none" stroke={colors[ki]} strokeWidth={2.5} strokeLinejoin="round" />
+            {data.map((d, i) => d[k] != null && (
+              <circle key={i} cx={i * xStep} cy={yScale(d[k])} r={3} fill={colors[ki]} />
+            ))}
+          </g>
+        ))}
+        {data.map((d, i) => (
+          <text key={i} x={i * xStep} y={H + 20} textAnchor="middle" fill="#475569" fontSize={9} fontFamily="DM Mono">{d.year || d.month?.split(" ")[0]}</text>
+        ))}
+        {keys.map((k, ki) => (
+          <g key={k} transform={`translate(${ki * 130}, ${H + 28})`}>
+            <rect width={8} height={3} fill={colors[ki]} rx={1} y={-1} />
+            <text x={12} fill="#a0aec0" fontSize={8} fontFamily="DM Sans">{labels[ki]}</text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// ── DONUT CHART ────────────────────────────────────────────────────────────
+function DonutChart({ slices }) {
+  const total = slices.reduce((s, x) => s + x.value, 0);
+  let angle = -90;
+  const R = 60, cx = 80, cy = 80;
+  const arcs = slices.map(s => {
+    const a = (s.value / total) * 360;
+    const startAngle = angle;
+    angle += a;
+    const toRad = d => (d * Math.PI) / 180;
+    const x1 = cx + R * Math.cos(toRad(startAngle));
+    const y1 = cy + R * Math.sin(toRad(startAngle));
+    const x2 = cx + R * Math.cos(toRad(angle - 0.1));
+    const y2 = cy + R * Math.sin(toRad(angle - 0.1));
+    const large = a > 180 ? 1 : 0;
+    return { ...s, d: `M ${cx} ${cy} L ${x1} ${y1} A ${R} ${R} 0 ${large} 1 ${x2} ${y2} Z`, pct: ((s.value / total) * 100).toFixed(1) };
+  });
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+      <svg viewBox="0 0 160 160" style={{ width: 140, flexShrink: 0 }}>
+        <circle cx={cx} cy={cy} r={38} fill="#0d1525" />
+        {arcs.map((a, i) => <path key={i} d={a.d} fill={a.color} opacity={0.9} />)}
+        <text x={cx} y={cy - 6} textAnchor="middle" fill="#e2e8f0" fontSize={11} fontWeight="bold" fontFamily="DM Mono">NET</text>
+        <text x={cx} y={cy + 8} textAnchor="middle" fill="#e2e8f0" fontSize={11} fontWeight="bold" fontFamily="DM Mono">WORTH</text>
+      </svg>
+      <div style={{ flex: 1 }}>
+        {arcs.map((a, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
+            <div style={{ width: 8, height: 8, borderRadius: 2, background: a.color, flexShrink: 0 }} />
+            <span style={{ fontSize: 11, color: "#a0aec0", fontFamily: "DM Sans", flex: 1 }}>{a.label}</span>
+            <span style={{ fontSize: 10, color: "#64748b", fontFamily: "DM Mono" }}>{a.pct}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── INPUT FIELD ────────────────────────────────────────────────────────────
+function InputField({ label, value, onChange, prefix = "₹", hint }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={{ display: "block", fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4, fontFamily: "DM Sans" }}>{label}</label>
+      <div style={{ display: "flex", alignItems: "center", background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 8, overflow: "hidden" }}>
+        <span style={{ padding: "8px 10px", color: "#475569", fontSize: 12, fontFamily: "DM Mono", borderRight: "1px solid #1e2d45" }}>{prefix}</span>
+        <input type="number" value={value} onChange={e => onChange(Number(e.target.value))}
+          style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "#e2e8f0", padding: "8px 10px", fontSize: 13, fontFamily: "DM Mono" }} />
+      </div>
+      {hint && <div style={{ fontSize: 9, color: "#374151", marginTop: 2, fontFamily: "DM Sans" }}>{hint}</div>}
+    </div>
+  );
+}
+
+// ── PARAMETER HISTORY TABLE ────────────────────────────────────────────────
+function ParamHistoryTable({ history }) {
+  if (!history || history.length === 0) {
+    return (
+      <div style={{ textAlign: "center", color: "#374151", fontSize: 12, fontFamily: "DM Sans", padding: 30 }}>
+        No history yet. Save your first update in the ✏️ Update tab.<br />
+        <span style={{ fontSize: 10, color: "#1e2d45" }}>After each save, a new column appears here.</span>
+      </div>
+    );
+  }
+
+  const sorted = [...history].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  const ROWS = [
+    { section: "📊 NET WORTH", isHeader: true },
+    { label: "Net Worth", field: "nw" },
+    { label: "Gross Assets", field: "grossAssets" },
+    { label: "Total Liabilities", field: "totalLiabilities", isLiability: true },
+    { section: "📈 STOCKS & MF", isHeader: true },
+    { label: "US Stocks — Principal (INR)", field: "usStocksPrincipalINR" },
+    { label: "US Stocks — Current (INR)", field: "usStocksINR" },
+    { label: "India Stocks — Principal (INR)", field: "indiaStocksPrincipal" },
+    { label: "India Stocks — Current (INR)", field: "indiaStocksINR" },
+    { label: "Indian MF — Principal", field: "mfPrincipal" },
+    { label: "Indian MF — Current Value", field: "mfCurrentValue" },
+    { section: "💎 ASSETS", isHeader: true },
+    { label: "F&O Corpus", field: "foCorpus" },
+    { label: "Gold — Jewellery", field: "goldJewellery" },
+    { label: "Gold — Malabar", field: "malabarGold" },
+    { label: "Apartment", field: "apartment" },
+    { label: "Gratuity", field: "gratuity" },
+    { label: "TALA", field: "tala" },
+    { section: "🇶🇦 QATAR BANKS (QAR)", isHeader: true },
+    { label: "Qatar Banks Total (INR)", field: "qatarBanksINR" },
+    { section: "🇮🇳 INDIA BANKS (INR)", isHeader: true },
+    { label: "India Banks Total (INR)", field: "indiaBanksINR" },
+    { section: "📉 LIABILITIES", isHeader: true },
+    { label: "Home Loan", field: "apartmentLoan", isLiability: true },
+    { label: "Car Loan", field: "carLoan", isLiability: true },
+  ];
+
+  const fmtCell = (val) => {
+    if (val == null || val === 0) return <span style={{ color: "#1e2d45" }}>—</span>;
+    return fmtCr(val);
+  };
+
+  const getTrend = (field, snapshots) => {
+    const vals = snapshots.map(s => s[field]).filter(v => v != null && v !== 0);
+    if (vals.length < 2) return null;
+    return vals[vals.length - 1] - vals[0];
+  };
+
+  return (
+    <div style={{ overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", minWidth: sorted.length * 100 + 180 }}>
+        <thead>
+          <tr>
+            <th style={{ position: "sticky", left: 0, zIndex: 2, background: "#060d1a", padding: "8px 12px", textAlign: "left", fontSize: 10, color: "#475569", fontFamily: "DM Sans", textTransform: "uppercase", letterSpacing: 1, borderBottom: "1px solid #1e2d45", minWidth: 180 }}>Parameter</th>
+            {sorted.map((h, i) => (
+              <th key={i} style={{ padding: "8px 12px", textAlign: "right", fontSize: 10, color: "#f0b429", fontFamily: "DM Mono", borderBottom: "1px solid #1e2d45", whiteSpace: "nowrap", minWidth: 100 }}>{h.date}</th>
+            ))}
+            <th style={{ padding: "8px 12px", textAlign: "right", fontSize: 10, color: "#a78bfa", fontFamily: "DM Mono", borderBottom: "1px solid #1e2d45", minWidth: 90 }}>TREND</th>
+          </tr>
+        </thead>
+        <tbody>
+          {ROWS.map((row, ri) => {
+            if (row.isHeader) {
+              return (
+                <tr key={ri}>
+                  <td colSpan={sorted.length + 2} style={{ padding: "10px 12px 4px", fontSize: 9, color: "#f0b429", fontFamily: "DM Sans", textTransform: "uppercase", letterSpacing: 2, background: "#060d1a", borderTop: "1px solid #1e2d45" }}>
+                    {row.section}
+                  </td>
+                </tr>
+              );
+            }
+            const trend = getTrend(row.field, sorted);
+            const isLiability = row.isLiability;
+            const trendColor = trend == null ? "#374151"
+              : (isLiability ? (trend < 0 ? "#34d399" : "#f87171") : (trend >= 0 ? "#34d399" : "#f87171"));
+            return (
+              <tr key={ri} style={{ borderBottom: "1px solid #0d1525" }}
+                onMouseEnter={e => e.currentTarget.style.background = "#0d1a2d"}
+                onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                <td style={{ position: "sticky", left: 0, background: "#060d1a", padding: "7px 12px", fontSize: 11, color: "#94a3b8", fontFamily: "DM Sans" }}>{row.label}</td>
+                {sorted.map((h, i) => {
+                  const val = h[row.field];
+                  const prevVal = i > 0 ? sorted[i - 1][row.field] : null;
+                  const diff = (val != null && prevVal != null) ? val - prevVal : null;
+                  const diffColor = diff == null ? null
+                    : (isLiability ? (diff < 0 ? "#34d399" : "#f87171") : (diff >= 0 ? "#34d399" : "#f87171"));
+                  return (
+                    <td key={i} style={{ padding: "7px 12px", textAlign: "right", fontSize: 11, fontFamily: "DM Mono", color: "#e2e8f0" }}>
+                      {fmtCell(val)}
+                      {diff !== null && diff !== 0 && (
+                        <div style={{ fontSize: 8, color: diffColor, marginTop: 1 }}>
+                          {diff >= 0 ? "▲" : "▼"} {fmtCr(Math.abs(diff))}
+                        </div>
+                      )}
+                    </td>
+                  );
+                })}
+                <td style={{ padding: "7px 12px", textAlign: "right", fontSize: 10, fontFamily: "DM Mono", color: trendColor }}>
+                  {trend != null ? (
+                    <span style={{ background: trendColor + "18", borderRadius: 4, padding: "2px 6px" }}>
+                      {trend >= 0 ? "▲" : "▼"} {fmtCr(Math.abs(trend))}
+                    </span>
+                  ) : "—"}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── MAIN DASHBOARD ─────────────────────────────────────────────────────────
+function Dashboard() {
+  const [manual, saveManual] = useStorage();
+  const [form, setForm] = useState(manual);
+  const [tab, setTab] = useState(0);
+  const [currency, setCurrency] = useState("INR");
+  // "principal" = show invested cost | "current" = show current value with PnL
+  const [investView, setInvestView] = useState("current");
+  const [githubData, setGithubData] = useState(null);
+  const [goldPrice, setGoldPrice] = useState(null);
+  const [rates, setRates] = useState({ ...FALLBACK, _live: false });
+  const [loading, setLoading] = useState({ github: true, gold: true, fx: true });
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [showSaved, setShowSaved] = useState(false);
+  const loadGhCfg = () => { try { const r = localStorage.getItem(GH_CFG_KEY); return r ? JSON.parse(r) : { user: "", repo: "", token: "" }; } catch { return { user: "", repo: "", token: "" }; } };
+  const [ghCfg, setGhCfg] = useState(loadGhCfg);
+  const [ghStatus, setGhStatus] = useState("");
+  const [ghLoading, setGhLoading] = useState(false);
+  const [ghFileSha, setGhFileSha] = useState("");
+  const saveGhCfg = (cfg) => { setGhCfg(cfg); try { localStorage.setItem(GH_CFG_KEY, JSON.stringify(cfg)); } catch {} };
+  const loadFromGitHub = async () => {
+    if (!ghCfg.user || !ghCfg.repo || !ghCfg.token) { setGhStatus("Enter credentials first"); return; }
+    setGhLoading(true); setGhStatus("Loading...");
+    try {
+      const res = await fetch(ghApiUrl(ghCfg.user, ghCfg.repo), { headers: ghHeaders(ghCfg.token) });
+      if (!res.ok) throw new Error("GitHub error " + res.status);
+      const json = await res.json();
+      const decoded = JSON.parse(atob(json.content.split("\n").join("")));
+      setGhFileSha(json.sha);
+      saveManual({ ...DEFAULT_MANUAL, ...decoded });
+      setForm({ ...DEFAULT_MANUAL, ...decoded });
+      setGhStatus("Loaded from GitHub successfully");
+    } catch (e) { setGhStatus("Load failed: " + e.message); }
+    setGhLoading(false);
+  };
+  const saveToGitHub = async (dataToSave) => {
+    if (!ghCfg.user || !ghCfg.repo || !ghCfg.token) return;
+    try {
+      const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(dataToSave, null, 2))));
+      const body = { message: "Wealth update " + todayKey(), content: encoded, ...(ghFileSha ? { sha: ghFileSha } : {}) };
+      const res = await fetch(ghApiUrl(ghCfg.user, ghCfg.repo), { method: "PUT", headers: ghHeaders(ghCfg.token), body: JSON.stringify(body) });
+      if (!res.ok) throw new Error("GitHub error " + res.status);
+      const json = await res.json();
+      setGhFileSha(json.content && json.content.sha ? json.content.sha : ghFileSha);
+      setGhStatus("Saved to GitHub");
+    } catch (e) { setGhStatus("GitHub save failed: " + e.message); }
+  };
+
+  // Fetch live FX rates
+  useEffect(() => {
+    fetch(FX_API)
+      .then(r => r.json())
+      .then(d => {
+        if (d?.rates) {
+          const USD_INR = d.rates.INR || FALLBACK.USD_INR;
+          const USD_QAR = d.rates.QAR || FALLBACK.USD_QAR;
+          const QAR_INR = USD_INR / USD_QAR;
+          setRates({ USD_INR, QAR_INR, USD_QAR, _live: true });
+        }
+        setLoading(p => ({ ...p, fx: false }));
+      })
+      .catch(() => setLoading(p => ({ ...p, fx: false })));
+  }, []);
+
+  // Fetch GitHub portfolio data
+  useEffect(() => {
+    fetch(`${GITHUB_RAW}/market_indices.json`)
+      .then(r => r.json())
+      .then(d => { setGithubData(d); setLoading(p => ({ ...p, github: false })); })
+      .catch(() => setLoading(p => ({ ...p, github: false })));
+  }, []);
+
+  // Fetch gold price
+  useEffect(() => {
+    fetch(GOLD_API)
+      .then(r => r.json())
+      .then(d => {
+        const usdPerTroyOz = Array.isArray(d) ? d[0]?.price : d?.price;
+        if (usdPerTroyOz) {
+          const inrPerGram = (usdPerTroyOz / 31.1035) * rates.USD_INR;
+          setGoldPrice({ usdPerOz: usdPerTroyOz, inrPerGram22k: inrPerGram * 0.916, inrPerGram24k: inrPerGram });
+        }
+        setLoading(p => ({ ...p, gold: false }));
+      })
+      .catch(() => setLoading(p => ({ ...p, gold: false })));
+  }, [rates.USD_INR]);
+
+  // ── COMPUTE VALUES ──
+  const usStocksCurrentUSD = githubData?.us_current_value_usd || githubData?.us_portfolio_value_usd || githubData?.total_value_usd || 16880.51;
+  const usStocksCurrentINR = usStocksCurrentUSD * rates.USD_INR;
+  const usStocksPrincipalUSD = manual.usStocksPrincipalUSD || 0;
+  const usStocksPrincipalINR = usStocksPrincipalUSD * rates.USD_INR;
+
+  const indiaStocksCurrentINR = githubData?.india_current_value_inr || githubData?.india_portfolio_value_inr || githubData?.total_value_inr || 2471568;
+  const indiaStocksPrincipal  = manual.indiaStocksPrincipal || 0;
+
+  const mfPrincipal     = manual.mfPrincipal || 0;
+  const mfCurrentValue  = manual.mfCurrentValue || 0;
+
+  // For net worth calculation — always use CURRENT values
+  const usStocksINR    = usStocksCurrentINR;
+  const indiaStocksINR = indiaStocksCurrentINR;
+
+  const qatarBanksQAR = (manual.hsbcSavings || 0) + (manual.hsbcCurrent || 0) + (manual.dohaBank_sav || 0) + (manual.dohaBank_cur || 0);
+  const qatarBanksINR = qatarBanksQAR * rates.QAR_INR;
+
+  const indiaBanksINR =
+    (manual.yesNRE || 0) + (manual.yesNRO || 0) + (manual.yesNROInvest || 0) +
+    (manual.idfcNRE || 0) + (manual.indusNRE || 0) + (manual.indusNREPIS || 0) +
+    (manual.indusNRO || 0) + (manual.canaraInr || 0) + (manual.iobNRE || 0) +
+    (manual.sbiNRO || 0) + (manual.axisNRE || 0) + (manual.idfcRI || 0) +
+    (manual.hsbc_india || 0) + (manual.tala || 0);
+
+  const grossAssets = usStocksINR + indiaStocksINR + mfCurrentValue + manual.foCorpus + manual.goldJewellery + manual.malabarGold + manual.apartment + manual.gratuity + (manual.landCruiser || 0) * rates.QAR_INR + qatarBanksINR + indiaBanksINR;
+
+  const ccLiabilitiesINR = ((manual.qatarAirwaysCC || 0) + (manual.luluCC || 0)) * rates.QAR_INR;
+  const totalLiabilities = (manual.apartmentLoan || 0) + (manual.carLoan || 0) + ccLiabilitiesINR;
+  const netWorth = grossAssets - totalLiabilities;
+
+  const thisMonth = nowStr();
+  const conservative = CONSERVATIVE_SCHEDULE.find(s => s.month === thisMonth)?.nw || CONSERVATIVE_SCHEDULE[0].nw;
+  const kpiDelta = netWorth - conservative;
+  const kpiPct = ((kpiDelta / conservative) * 100).toFixed(1);
+
+  const history = manual.history || [];
+  const sortedHistory = [...history].sort((a, b) => new Date(a.date) - new Date(b.date));
+  const prevSnapshot = sortedHistory.length >= 1 ? sortedHistory[sortedHistory.length - 1] : null;
+  const prevNW = prevSnapshot?.nw || null;
+  const monthChange = prevNW ? netWorth - prevNW : null;
+
+  const delta = (currentVal, field) => {
+    if (!prevSnapshot || prevSnapshot[field] === undefined) return null;
+    return currentVal - (prevSnapshot[field] || 0);
+  };
+  const fmtDelta = (d) => {
+    if (d === null) return null;
+    const sign = d >= 0 ? "+" : "";
+    const abs = Math.abs(d);
+    const val = abs >= 10000000 ? `₹${(abs / 10000000).toFixed(2)}Cr` : abs >= 100000 ? `₹${(abs / 100000).toFixed(1)}L` : `₹${Math.round(abs).toLocaleString("en-IN")}`;
+    return { text: `${sign}${val}`, color: d >= 0 ? "#34d399" : "#f87171" };
+  };
+
+  // Decide which value to show for investments based on toggle
+  const usStocksDisplayINR    = investView === "principal" ? usStocksPrincipalINR  : usStocksCurrentINR;
+  const indiaStocksDisplayINR = investView === "principal" ? indiaStocksPrincipal  : indiaStocksCurrentINR;
+  const mfDisplayINR          = investView === "principal" ? mfPrincipal           : mfCurrentValue;
+
+  // Total investment PnL summary
+  const totalInvestPrincipal = usStocksPrincipalINR + indiaStocksPrincipal + mfPrincipal;
+  const totalInvestCurrent   = usStocksCurrentINR   + indiaStocksCurrentINR + mfCurrentValue;
+  const totalPnL             = totalInvestCurrent - totalInvestPrincipal;
+  const totalPnLPct          = totalInvestPrincipal > 0 ? ((totalPnL / totalInvestPrincipal) * 100).toFixed(1) : null;
+
+  const assetSlices = [
+    { label: "F&O Corpus",     value: manual.foCorpus,                   color: "#f0b429" },
+    { label: "India Stocks",   value: indiaStocksCurrentINR,             color: "#38bdf8" },
+    { label: "US Stocks",      value: usStocksCurrentINR,                color: "#34d399" },
+    { label: "Indian MF",      value: mfCurrentValue,                    color: "#818cf8" },
+    { label: "Gold",           value: manual.goldJewellery + manual.malabarGold, color: "#fb923c" },
+    { label: "Apartment",      value: manual.apartment,                   color: "#a78bfa" },
+    { label: "Gratuity",       value: manual.gratuity,                   color: "#f472b6" },
+    { label: "Cash (Banks)",   value: qatarBanksINR + indiaBanksINR,     color: "#6ee7b7" },
+  ].filter(s => s.value > 0);
+
+  // ── SAVE ──
+  const handleSave = () => {
+    const prev = manual.history || [];
+    const entry = {
+      date: todayKey(),
+      nw: netWorth, conservative, grossAssets, totalLiabilities,
+      usStocksINR: usStocksCurrentINR, usStocksCurrentUSD, usStocksPrincipalINR, usStocksPrincipalUSD,
+      indiaStocksINR: indiaStocksCurrentINR, indiaStocksPrincipal,
+      mfPrincipal, mfCurrentValue,
+      foCorpus: form.foCorpus || 0, goldJewellery: form.goldJewellery || 0,
+      malabarGold: form.malabarGold || 0, apartment: form.apartment || 0,
+      gratuity: form.gratuity || 0, tala: form.tala || 0,
+      hsbcSavings: form.hsbcSavings || 0, hsbcCurrent: form.hsbcCurrent || 0,
+      dohaBank_sav: form.dohaBank_sav || 0, dohaBank_cur: form.dohaBank_cur || 0,
+      qatarBanksINR, indiaBanksINR,
+      apartmentLoan: form.apartmentLoan || 0, carLoan: form.carLoan || 0,
+    };
+    const updated = { ...form, history: [...prev.filter(h => h.date !== entry.date), entry] };
+    saveManual(updated);
+    setLastUpdated(new Date().toLocaleTimeString());
+    setShowSaved(true);
+    setTimeout(() => setShowSaved(false), 3000);
+    saveToGitHub(updated);
+  };
+
+  const D = (inrVal) => inrTo(inrVal, currency, rates);
+
+  const TABS  = ["Dashboard", "Assets", "Liabilities", "Forecast", "Update", "Performance", "History", "Settings"];
+  const ICONS = ["📊", "🏦", "📉", "🔭", "✏️", "📈", "🗓️", "⚙️"];
+
+  return (
+    <>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: #060d1a; }
+        .card { background: #0d1a2d; border: 1px solid #1e2d45; border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+        .tab-btn { background: none; border: none; cursor: pointer; padding: 8px 12px; border-radius: 8px; font-family: DM Sans; font-size: 12px; transition: all 0.2s; white-space: nowrap; }
+        .tab-btn.active { background: #1e3a5f; color: #f0b429; }
+        .tab-btn:not(.active) { color: #475569; }
+        .tab-btn:hover:not(.active) { color: #94a3b8; background: #0d1525; }
+        .save-btn { background: linear-gradient(135deg, #f0b429, #d97706); border: none; border-radius: 10px; padding: 12px 24px; color: #0d1a2d; font-family: DM Sans; font-weight: 700; font-size: 14px; cursor: pointer; width: 100%; margin-top: 8px; transition: opacity 0.2s; }
+        .save-btn:hover { opacity: 0.9; }
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: #060d1a; }
+        ::-webkit-scrollbar-thumb { background: #1e2d45; border-radius: 2px; }
+        input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; }
+        tr:hover td { background: #0d1a2d !important; }
+      `}</style>
+
+      <div style={{ minHeight: "100vh", background: "#060d1a", padding: "16px", fontFamily: "DM Sans" }}>
+
+        {/* HEADER */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+            <div>
+              <div style={{ fontSize: 10, color: "#f0b429", textTransform: "uppercase", letterSpacing: 3, fontFamily: "DM Sans", marginBottom: 4 }}>PERSONAL WEALTH TRACKER</div>
+              <h1 style={{ fontSize: 26, fontWeight: 900, color: "#e2e8f0", fontFamily: "Playfair Display", lineHeight: 1 }}>
+                Sabarna <span style={{ color: "#f0b429" }}>·</span> DBG
+              </h1>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
+              <CurrencyToggle currency={currency} setCurrency={setCurrency} rates={rates} />
+              <div style={{ fontSize: 10, color: "#374151", fontFamily: "DM Mono" }}>
+                {loading.github ? "⏳ Fetching stocks..." : `✅ US $${fmt(usStocksCurrentUSD)} · India ₹${(indiaStocksCurrentINR / 100000).toFixed(1)}L`}
+              </div>
+              <div style={{ fontSize: 10, color: "#374151", fontFamily: "DM Mono" }}>
+                {loading.gold ? "⏳ Gold..." : goldPrice ? `✅ Gold ₹${fmt(goldPrice.inrPerGram22k, 0)}/g(22K)` : "⚠️ Gold manual"}&nbsp;&nbsp;
+                {rates._live ? `🟢 $1=₹${rates.USD_INR.toFixed(1)} · QAR=₹${rates.QAR_INR.toFixed(2)}` : "⚠️ Rates static"}
+              </div>
+              {lastUpdated && <div style={{ fontSize: 9, color: "#1e3a5f", fontFamily: "DM Mono" }}>Saved {lastUpdated}</div>}
+            </div>
+          </div>
+        </div>
+
+        {/* KPI BANNER */}
+        <div style={{ background: kpiDelta >= 0 ? "linear-gradient(135deg,#052e16,#064e3b)" : "linear-gradient(135deg,#1f0a0a,#3b0a0a)", border: `1px solid ${kpiDelta >= 0 ? "#065f46" : "#7f1d1d"}`, borderRadius: 14, padding: "14px 20px", marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <div style={{ fontSize: 10, color: kpiDelta >= 0 ? "#34d399" : "#f87171", textTransform: "uppercase", letterSpacing: 2, fontFamily: "DM Sans" }}>Monthly KPI — {thisMonth}</div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: "#e2e8f0", fontFamily: "DM Mono", marginTop: 2 }}>{D(netWorth)}</div>
+            {currency !== "INR" && <div style={{ fontSize: 11, color: "#475569", fontFamily: "DM Mono" }}>{fmtCr(netWorth)}</div>}
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 11, color: "#a0aec0", fontFamily: "DM Sans" }}>Conservative Target</div>
+            <div style={{ fontSize: 14, fontFamily: "DM Mono", color: "#94a3b8" }}>{D(conservative)}</div>
+            <div style={{ fontSize: 16, fontWeight: 700, fontFamily: "DM Mono", color: kpiDelta >= 0 ? "#34d399" : "#f87171", marginTop: 2 }}>
+              {kpiDelta >= 0 ? "▲" : "▼"} {D(Math.abs(kpiDelta))} ({kpiDelta >= 0 ? "+" : ""}{kpiPct}%)
+            </div>
+          </div>
+        </div>
+
+        {/* TABS */}
+        <div style={{ display: "flex", gap: 4, overflowX: "auto", marginBottom: 16, paddingBottom: 4 }}>
+          {TABS.map((t, i) => (
+            <button key={i} className={`tab-btn ${tab === i ? "active" : ""}`} onClick={() => setTab(i)}>
+              {ICONS[i]} {t}
+            </button>
+          ))}
+        </div>
+
+        {/* ── TAB 0: DASHBOARD ── */}
+        {tab === 0 && (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
+              <StatBox label="Net Worth" value={D(netWorth)}
+                sub={currency === "INR" ? `${fmtUSD(netWorth, rates)} · ${fmtQAR(netWorth, rates)}` : `= ${fmtCr(netWorth)}`}
+                color="#f0b429" />
+              <StatBox label="Gross Assets" value={D(grossAssets)} sub="Before liabilities" color="#34d399" />
+              <StatBox label="Total Liabilities" value={D(totalLiabilities)} sub="Home + Car + CCs" color="#f87171" />
+              <StatBox label="Wealth Rank" value="Top 1%" sub="India — Already there ✅" color="#a78bfa" />
+            </div>
+
+            {/* Investment Portfolio Summary with toggle */}
+            {totalInvestPrincipal > 0 && (
+              <Card>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                  <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, fontFamily: "DM Sans" }}>Investment Portfolio</div>
+                  <ViewToggle view={investView} setView={setInvestView} />
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                  <div style={{ background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 10, padding: "12px" }}>
+                    <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, fontFamily: "DM Sans", marginBottom: 4 }}>Invested</div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: "#94a3b8", fontFamily: "DM Mono" }}>{D(totalInvestPrincipal)}</div>
+                  </div>
+                  <div style={{ background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 10, padding: "12px" }}>
+                    <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, fontFamily: "DM Sans", marginBottom: 4 }}>Current</div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: "#f0b429", fontFamily: "DM Mono" }}>{D(totalInvestCurrent)}</div>
+                  </div>
+                  <div style={{ background: totalPnL >= 0 ? "#052e16" : "#1f0a0a", border: `1px solid ${totalPnL >= 0 ? "#065f46" : "#7f1d1d"}`, borderRadius: 10, padding: "12px" }}>
+                    <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, fontFamily: "DM Sans", marginBottom: 4 }}>Total P&L</div>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: totalPnL >= 0 ? "#34d399" : "#f87171", fontFamily: "DM Mono" }}>
+                      {totalPnL >= 0 ? "+" : ""}{D(totalPnL)}
+                    </div>
+                    {totalPnLPct && <div style={{ fontSize: 9, color: totalPnL >= 0 ? "#34d399" : "#f87171", fontFamily: "DM Mono" }}>{totalPnL >= 0 ? "+" : ""}{totalPnLPct}%</div>}
+                  </div>
+                </div>
+              </Card>
+            )}
+
+            <Card>
+              <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14, fontFamily: "DM Sans" }}>Progress to Targets</div>
+              {TARGETS.map(t => (
+                <ProgressBar key={t.label} label={t.label} value={netWorth} max={t.value}
+                  sub={`${fmtCr(netWorth)} / ${t.label}`}
+                  color={netWorth >= t.value ? "#34d399" : "#f0b429"} />
+              ))}
+            </Card>
+
+            <Card>
+              <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14, fontFamily: "DM Sans" }}>Asset Allocation</div>
+              <DonutChart slices={assetSlices} />
+            </Card>
+
+            {monthChange !== null && (
+              <Card>
+                <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 10, fontFamily: "DM Sans" }}>Month on Month</div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontSize: 22, fontWeight: 700, color: monthChange >= 0 ? "#34d399" : "#f87171", fontFamily: "DM Mono" }}>
+                      {monthChange >= 0 ? "+" : ""}{D(monthChange)}
+                    </div>
+                    <div style={{ fontSize: 11, color: "#64748b", fontFamily: "DM Sans" }}>vs previous snapshot</div>
+                  </div>
+                  <div style={{ fontSize: 32 }}>{monthChange >= 0 ? "🟢" : "🔴"}</div>
+                </div>
+              </Card>
+            )}
+          </>
+        )}
+
+        {/* ── TAB 1: ASSETS ── */}
+        {tab === 1 && (
+          <>
+            <SectionTitle n="2" title="Asset Breakdown" icon="🏦" />
+
+            {/* View toggle for investment assets */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div style={{ fontSize: 11, color: "#475569", fontFamily: "DM Sans" }}>Stocks & MF view:</div>
+              <ViewToggle view={investView} setView={setInvestView} />
+            </div>
+
+            {/* Investment assets with Principal/Current toggle */}
+            <InvestmentCard
+              label="US Stocks"
+              principalUSD={usStocksPrincipalUSD}
+              currentUSD={usStocksCurrentUSD}
+              view={investView}
+              currency={currency}
+              rates={rates}
+              color="#34d399"
+              loading={loading.github}
+              note={loading.github ? "Fetching..." : `Live from GitHub · $${fmt(usStocksCurrentUSD)} @ ₹${rates.USD_INR.toFixed(1)}/USD`}
+            />
+
+            <InvestmentCard
+              label="India Stocks"
+              principalINR={indiaStocksPrincipal}
+              currentINR={indiaStocksCurrentINR}
+              view={investView}
+              currency={currency}
+              rates={rates}
+              color="#38bdf8"
+              loading={loading.github}
+              note={loading.github ? "Fetching..." : "Live from GitHub portfolio"}
+            />
+
+            <InvestmentCard
+              label="Indian Mutual Funds"
+              principalINR={mfPrincipal}
+              currentINR={mfCurrentValue}
+              view={investView}
+              currency={currency}
+              rates={rates}
+              color="#818cf8"
+              note="Update current value monthly from CAMS / MFCentral"
+            />
+
+            {/* Other assets */}
+            {[
+              { label: "F&O Corpus", val: manual.foCorpus, note: "Flat — returns fund home EMI ₹40K/month", color: "#f0b429" },
+              { label: "Gold — Jewellery", val: manual.goldJewellery, note: goldPrice ? `Live: ₹${fmt(goldPrice.inrPerGram22k, 0)}/g (22K)` : "Manual value", color: "#fb923c" },
+              { label: "Gold — Malabar", val: manual.malabarGold, note: "Accumulated scheme balance", color: "#fbbf24" },
+              { label: "Apartment (India)", val: manual.apartment, note: "Market value estimate", color: "#a78bfa" },
+              { label: "Gratuity", val: manual.gratuity, note: "+QAR 10,500 every January", color: "#f472b6" },
+              { label: "TALA", val: manual.tala, note: "₹11L asset — update if value changes", color: "#6ee7b7" },
+              { label: "Land Cruiser Resale", val: (manual.landCruiser || 0) * rates.QAR_INR, note: manual.landCruiser ? `QAR ${fmt(manual.landCruiser, 0)}` : "Not counted — unlocks Apr 2030 when loan ends", color: "#6ee7b7" },
+              { label: "Qatar Banks", val: qatarBanksINR, note: `QAR ${fmt(qatarBanksQAR, 0)} total @ ₹${rates.QAR_INR.toFixed(2)}/QAR`, color: "#f0b429" },
+              { label: "India Banks", val: indiaBanksINR, note: "All NRE/NRO/RI accounts + TALA", color: "#38bdf8" },
+            ].map((a, i) => (
+              <Card key={i}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "#cbd5e1", fontFamily: "DM Sans" }}>{a.label}</div>
+                    <div style={{ fontSize: 10, color: "#374151", marginTop: 2, fontFamily: "DM Sans" }}>{a.note}</div>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: a.color, fontFamily: "DM Mono" }}>{D(a.val)}</div>
+                    {currency !== "INR" && <div style={{ fontSize: 10, color: "#475569", fontFamily: "DM Mono" }}>{fmtCr(a.val)}</div>}
+                  </div>
+                </div>
+              </Card>
+            ))}
+
+            <Card style={{ background: "#0a1f0a" }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "#34d399", fontFamily: "DM Sans" }}>GROSS ASSETS</div>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "#34d399", fontFamily: "DM Mono" }}>{D(grossAssets)}</div>
+                  {currency !== "INR" && <div style={{ fontSize: 11, color: "#475569", textAlign: "right", fontFamily: "DM Mono" }}>{fmtCr(grossAssets)}</div>}
+                </div>
+              </div>
+            </Card>
+          </>
+        )}
+
+        {/* ── TAB 2: LIABILITIES ── */}
+        {tab === 2 && (
+          <>
+            <SectionTitle n="3" title="Liability Tracker" icon="📉" />
+            <Card>
+              <div style={{ fontSize: 12, color: "#f87171", marginBottom: 16, fontFamily: "DM Sans" }}>Home Loan — India</div>
+              <ProgressBar label="Paid down" value={3800000 - manual.apartmentLoan} max={3800000}
+                sub={`${fmtCr(manual.apartmentLoan)} remaining`} color="#f87171" />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 12 }}>
+                <StatBox label="Outstanding" value={D(manual.apartmentLoan)} color="#f87171" small />
+                <StatBox label="EMI Source" value="F&O Returns" sub="₹40K/month — India" color="#34d399" small />
+              </div>
+            </Card>
+
+            <Card>
+              <div style={{ fontSize: 12, color: "#fb923c", marginBottom: 16, fontFamily: "DM Sans" }}>Land Cruiser Loan — Qatar</div>
+              <ProgressBar label="Paid down" value={6370000 - manual.carLoan} max={6370000}
+                sub={`${fmtCr(manual.carLoan)} remaining`} color="#fb923c" />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 12 }}>
+                <StatBox label="Outstanding" value={D(manual.carLoan)} color="#fb923c" small />
+                <StatBox label="Ends" value="Apr 2030" sub="QAR 6,800 freed/month" color="#34d399" small />
+              </div>
+            </Card>
+
+            <Card>
+              <div style={{ fontSize: 12, color: "#a78bfa", marginBottom: 16, fontFamily: "DM Sans" }}>Credit Cards — Qatar (QAR)</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div style={{ background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 10, padding: "14px 16px" }}>
+                  <div style={{ fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, fontFamily: "DM Sans", marginBottom: 6 }}>Qatar Airways CC</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: (manual.qatarAirwaysCC || 0) > 0 ? "#f87171" : "#34d399", fontFamily: "DM Mono" }}>
+                    QAR {fmt(manual.qatarAirwaysCC || 0, 0)}
+                  </div>
+                </div>
+                <div style={{ background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 10, padding: "14px 16px" }}>
+                  <div style={{ fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, fontFamily: "DM Sans", marginBottom: 6 }}>Lulu CC</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: (manual.luluCC || 0) > 0 ? "#f87171" : "#34d399", fontFamily: "DM Mono" }}>
+                    QAR {fmt(manual.luluCC || 0, 0)}
+                  </div>
+                </div>
+              </div>
+            </Card>
+
+            <Card>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: "#f87171", fontFamily: "DM Sans", display: "flex", alignItems: "center", gap: 6 }}>
+                    TOTAL LIABILITIES
+                    <DeltaBadge d={fmtDelta(delta(totalLiabilities, "totalLiabilities"))} />
+                  </div>
+                  <div style={{ fontSize: 9, color: "#374151", fontFamily: "DM Sans", marginTop: 2 }}>Negative delta = good ✅</div>
+                </div>
+                <div style={{ fontSize: 18, fontWeight: 700, color: "#f87171", fontFamily: "DM Mono" }}>{D(totalLiabilities)}</div>
+              </div>
+            </Card>
+          </>
+        )}
+
+        {/* ── TAB 3: FORECAST ── */}
+        {tab === 3 && (
+          <>
+            <SectionTitle n="4" title="2026 → 2031 Forecast" icon="🔭" />
+            <Card>
+              <LineChart data={FORECAST} keys={["conservative", "base", "optimistic"]}
+                colors={["#64748b", "#f0b429", "#34d399"]}
+                labels={["Conservative", "Base (12%)", "Optimistic (15%)"]} height={160} />
+            </Card>
+            {[
+              { year: "2027", nw: "₹1.91 Cr", note: "March target", color: "#94a3b8" },
+              { year: "2028", nw: "₹2.4 Cr", note: "Top 1% India crossed ✅", color: "#38bdf8" },
+              { year: "2029", nw: "~₹2.9 Cr", note: "$100K US portfolio milestone", color: "#a78bfa" },
+              { year: "2030", nw: "~₹3.5 Cr", note: "Car loan ends + QAR 1,20,000 resale — wealth mode 🚀", color: "#fb923c" },
+              { year: "2031", nw: "₹4.09–4.5 Cr", note: "Top 0.1% India — Age 40 🎯", color: "#34d399" },
+            ].map((m, i) => (
+              <Card key={i}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontSize: 11, color: "#475569", fontFamily: "DM Mono" }}>{m.year}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: m.color, fontFamily: "DM Mono" }}>{m.nw}</div>
+                    <div style={{ fontSize: 10, color: "#64748b", fontFamily: "DM Sans", marginTop: 2 }}>{m.note}</div>
+                  </div>
+                  <div style={{ width: 4, height: 40, background: m.color, borderRadius: 2 }} />
+                </div>
+              </Card>
+            ))}
+          </>
+        )}
+
+        {/* ── TAB 4: UPDATE ── */}
+        {tab === 4 && (
+          <>
+            <SectionTitle n="5" title="Monthly Update" icon="✏️" />
+            <div style={{ background: "#052e16", border: "1px solid #065f46", borderRadius: 10, padding: "10px 14px", marginBottom: 14, fontSize: 11, color: "#34d399", fontFamily: "DM Sans" }}>
+              🟢 Stocks auto-fetched from GitHub · Gold price auto-fetched · FX rates {rates._live ? "live" : "static"}
+            </div>
+
+            {/* INVESTMENT PRINCIPALS */}
+            <Card>
+              <div style={{ fontSize: 11, color: "#818cf8", textTransform: "uppercase", letterSpacing: 2, marginBottom: 12, fontFamily: "DM Sans" }}>📈 Investment Principals — Manual Entry</div>
+              <div style={{ background: "#0d1525", border: "1px solid #1e3a5f", borderRadius: 8, padding: "8px 12px", marginBottom: 12, fontSize: 10, color: "#475569", fontFamily: "DM Sans" }}>
+                Current values are auto-fetched. Enter your invested principal here to track P&L.
+              </div>
+              <InputField label="US Stocks — Principal Invested" prefix="USD $" value={form.usStocksPrincipalUSD || 0}
+                onChange={v => setForm(p => ({ ...p, usStocksPrincipalUSD: v }))}
+                hint={`= ${fmtCr((form.usStocksPrincipalUSD || 0) * rates.USD_INR)} · Current: $${fmt(usStocksCurrentUSD, 0)} · P&L: ${pnlInfo((form.usStocksPrincipalUSD||0)*rates.USD_INR, usStocksCurrentINR) ? (pnlInfo((form.usStocksPrincipalUSD||0)*rates.USD_INR, usStocksCurrentINR).sign + pnlInfo((form.usStocksPrincipalUSD||0)*rates.USD_INR, usStocksCurrentINR).pct + "%") : "—"}`} />
+              <InputField label="India Stocks — Principal Invested" prefix="₹" value={form.indiaStocksPrincipal || 0}
+                onChange={v => setForm(p => ({ ...p, indiaStocksPrincipal: v }))}
+                hint={`Current: ${fmtCr(indiaStocksCurrentINR)} · P&L: ${pnlInfo(form.indiaStocksPrincipal || 0, indiaStocksCurrentINR) ? (pnlInfo(form.indiaStocksPrincipal || 0, indiaStocksCurrentINR).sign + pnlInfo(form.indiaStocksPrincipal || 0, indiaStocksCurrentINR).pct + "%") : "—"}`} />
+            </Card>
+
+            {/* INDIAN MF */}
+            <Card>
+              <div style={{ fontSize: 11, color: "#818cf8", textTransform: "uppercase", letterSpacing: 2, marginBottom: 12, fontFamily: "DM Sans" }}>🇮🇳 Indian Mutual Funds</div>
+              <InputField label="MF — Total Principal Invested" prefix="₹" value={form.mfPrincipal || 0}
+                onChange={v => setForm(p => ({ ...p, mfPrincipal: v }))}
+                hint="Sum of all SIPs + lump sum invested" />
+              <InputField label="MF — Current NAV Value" prefix="₹" value={form.mfCurrentValue || 0}
+                onChange={v => setForm(p => ({ ...p, mfCurrentValue: v }))}
+                hint="Get from CAMS / MFCentral / Kuvera / Zerodha Coin" />
+              {(form.mfPrincipal > 0 && form.mfCurrentValue > 0) && (() => {
+                const info = pnlInfo(form.mfPrincipal, form.mfCurrentValue);
+                return (
+                  <div style={{ background: info.pnl >= 0 ? "#052e16" : "#1f0a0a", border: `1px solid ${info.pnl >= 0 ? "#065f46" : "#7f1d1d"}`, borderRadius: 8, padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: "#94a3b8", fontFamily: "DM Sans" }}>MF Unrealised P&L</span>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: info.color, fontFamily: "DM Mono" }}>
+                      {info.sign}{fmtCr(Math.abs(info.pnl))} ({info.sign}{info.pct}%)
+                    </span>
+                  </div>
+                );
+              })()}
+            </Card>
+
+            {/* QATAR BANKS */}
+            <Card>
+              <div style={{ fontSize: 11, color: "#f0b429", textTransform: "uppercase", letterSpacing: 2, marginBottom: 12, fontFamily: "DM Sans" }}>🇶🇦 Qatar Banks — Input in QAR</div>
+              <InputField label="HSBC Qatar — Savings" prefix="QAR" value={form.hsbcSavings || 0} onChange={v => setForm(p => ({ ...p, hsbcSavings: v }))} hint={`= ${fmtCr((form.hsbcSavings||0)*rates.QAR_INR)}`} />
+              <InputField label="HSBC Qatar — Current" prefix="QAR" value={form.hsbcCurrent || 0} onChange={v => setForm(p => ({ ...p, hsbcCurrent: v }))} hint={`= ${fmtCr((form.hsbcCurrent||0)*rates.QAR_INR)}`} />
+              <InputField label="Doha Bank — Savings" prefix="QAR" value={form.dohaBank_sav || 0} onChange={v => setForm(p => ({ ...p, dohaBank_sav: v }))} hint={`= ${fmtCr((form.dohaBank_sav||0)*rates.QAR_INR)}`} />
+              <InputField label="Doha Bank — Current" prefix="QAR" value={form.dohaBank_cur || 0} onChange={v => setForm(p => ({ ...p, dohaBank_cur: v }))} hint={`= ${fmtCr((form.dohaBank_cur||0)*rates.QAR_INR)}`} />
+            </Card>
+
+            {/* INDIA BANKS */}
+            <Card>
+              <div style={{ fontSize: 11, color: "#38bdf8", textTransform: "uppercase", letterSpacing: 2, marginBottom: 12, fontFamily: "DM Sans" }}>🇮🇳 India Banks — Input in ₹</div>
+              <InputField label="Yes Bank — NRE" prefix="₹" value={form.yesNRE || 0} onChange={v => setForm(p => ({ ...p, yesNRE: v }))} />
+              <InputField label="Yes Bank — NRO" prefix="₹" value={form.yesNRO || 0} onChange={v => setForm(p => ({ ...p, yesNRO: v }))} />
+              <InputField label="Yes Bank — NRO Invest" prefix="₹" value={form.yesNROInvest || 0} onChange={v => setForm(p => ({ ...p, yesNROInvest: v }))} />
+              <InputField label="IDFCFB — NRE" prefix="₹" value={form.idfcNRE || 0} onChange={v => setForm(p => ({ ...p, idfcNRE: v }))} />
+              <InputField label="IndusInd — NRE" prefix="₹" value={form.indusNRE || 0} onChange={v => setForm(p => ({ ...p, indusNRE: v }))} />
+              <InputField label="IndusInd — NRE PIS" prefix="₹" value={form.indusNREPIS || 0} onChange={v => setForm(p => ({ ...p, indusNREPIS: v }))} />
+              <InputField label="IndusInd — NRO" prefix="₹" value={form.indusNRO || 0} onChange={v => setForm(p => ({ ...p, indusNRO: v }))} />
+              <InputField label="Canara — NRE" prefix="₹" value={form.canaraInr || 0} onChange={v => setForm(p => ({ ...p, canaraInr: v }))} />
+              <InputField label="IOB — NRE" prefix="₹" value={form.iobNRE || 0} onChange={v => setForm(p => ({ ...p, iobNRE: v }))} />
+              <InputField label="SBI — NRO" prefix="₹" value={form.sbiNRO || 0} onChange={v => setForm(p => ({ ...p, sbiNRO: v }))} />
+              <InputField label="Axis Bank — NRE" prefix="₹" value={form.axisNRE || 0} onChange={v => setForm(p => ({ ...p, axisNRE: v }))} />
+              <InputField label="IDFCFB — RI" prefix="₹" value={form.idfcRI || 0} onChange={v => setForm(p => ({ ...p, idfcRI: v }))} />
+              <InputField label="HSBC India" prefix="₹" value={form.hsbc_india || 0} onChange={v => setForm(p => ({ ...p, hsbc_india: v }))} />
+              <InputField label="TALA" prefix="₹" value={form.tala || 1100000} onChange={v => setForm(p => ({ ...p, tala: v }))} hint="₹11L asset — update if value changes" />
+            </Card>
+
+            {/* CREDIT CARDS */}
+            <Card>
+              <div style={{ fontSize: 11, color: "#a78bfa", textTransform: "uppercase", letterSpacing: 2, marginBottom: 12, fontFamily: "DM Sans" }}>💳 Credit Cards Outstanding — QAR</div>
+              <InputField label="Qatar Airways Card" prefix="QAR" value={form.qatarAirwaysCC || 0} onChange={v => setForm(p => ({ ...p, qatarAirwaysCC: v }))} />
+              <InputField label="Lulu Card" prefix="QAR" value={form.luluCC || 0} onChange={v => setForm(p => ({ ...p, luluCC: v }))} />
+            </Card>
+
+            {/* LIABILITIES */}
+            <Card>
+              <div style={{ fontSize: 11, color: "#f87171", textTransform: "uppercase", letterSpacing: 2, marginBottom: 12, fontFamily: "DM Sans" }}>📉 Loans</div>
+              <InputField label="Canara Home Loan Outstanding" prefix="₹" value={form.apartmentLoan || 4118072} onChange={v => setForm(p => ({ ...p, apartmentLoan: v }))} hint="Reducing monthly — funded by F&O returns" />
+              <InputField label="Land Cruiser Loan Outstanding" prefix="₹" value={form.carLoan || 6370000} onChange={v => setForm(p => ({ ...p, carLoan: v }))} hint="EMI QAR 6,800 — ends Apr 2030" />
+            </Card>
+
+            {/* OTHER ASSETS */}
+            <Card>
+              <div style={{ fontSize: 11, color: "#a78bfa", textTransform: "uppercase", letterSpacing: 2, marginBottom: 12, fontFamily: "DM Sans" }}>💎 Other Assets</div>
+              <InputField label="F&O Corpus" prefix="₹" value={form.foCorpus || 7000000} onChange={v => setForm(p => ({ ...p, foCorpus: v }))} hint="Returns fund home EMI ₹40K/month" />
+              <InputField label="Gold — Jewellery" prefix="₹" value={form.goldJewellery || 4500000} onChange={v => setForm(p => ({ ...p, goldJewellery: v }))} />
+              <InputField label="Gold — Malabar Balance" prefix="₹" value={form.malabarGold || 600000} onChange={v => setForm(p => ({ ...p, malabarGold: v }))} />
+              <InputField label="Apartment Market Value" prefix="₹" value={form.apartment || 6500000} onChange={v => setForm(p => ({ ...p, apartment: v }))} />
+              <InputField label="Gratuity Accumulated" prefix="₹" value={form.gratuity || 1970000} onChange={v => setForm(p => ({ ...p, gratuity: v }))} />
+              <InputField label="Land Cruiser Resale (Apr 2030)" prefix="QAR" value={form.landCruiser || 0} onChange={v => setForm(p => ({ ...p, landCruiser: v }))}
+                hint="Leave 0 now — enter 120000 when car loan ends Apr 2030" />
+            </Card>
+
+            <button className="save-btn" onClick={handleSave}>
+              {showSaved ? "✅ Saved Successfully!" : `💾 Save & Recalculate — ${todayKey()}`}
+            </button>
+          </>
+        )}
+
+        {/* ── TAB 5: PERFORMANCE ── */}
+        {tab === 5 && (
+          <>
+            <SectionTitle n="6" title="Monthly Performance" icon="📈" />
+
+            {/* Investment P&L summary */}
+            {totalInvestPrincipal > 0 && (
+              <Card>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                  <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, fontFamily: "DM Sans" }}>Investment P&L Summary</div>
+                </div>
+                {[
+                  { label: "US Stocks", principal: usStocksPrincipalINR, current: usStocksCurrentINR, color: "#34d399" },
+                  { label: "India Stocks", principal: indiaStocksPrincipal, current: indiaStocksCurrentINR, color: "#38bdf8" },
+                  { label: "Indian MF", principal: mfPrincipal, current: mfCurrentValue, color: "#818cf8" },
+                ].map((inv, i) => {
+                  const info = pnlInfo(inv.principal, inv.current);
+                  if (!inv.principal) return null;
+                  return (
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #0d1525" }}>
+                      <div>
+                        <div style={{ fontSize: 12, color: "#94a3b8", fontFamily: "DM Sans" }}>{inv.label}</div>
+                        <div style={{ fontSize: 10, color: "#475569", fontFamily: "DM Mono" }}>Cost: {fmtCr(inv.principal)} → Now: {fmtCr(inv.current)}</div>
+                      </div>
+                      {info && (
+                        <div style={{ textAlign: "right" }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: info.color, fontFamily: "DM Mono" }}>
+                            {info.sign}{fmtCr(Math.abs(info.pnl))}
+                          </div>
+                          <div style={{ fontSize: 10, color: info.color, fontFamily: "DM Mono" }}>{info.sign}{info.pct}%</div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                <div style={{ marginTop: 10, background: totalPnL >= 0 ? "#052e16" : "#1f0a0a", border: `1px solid ${totalPnL >= 0 ? "#065f46" : "#7f1d1d"}`, borderRadius: 8, padding: "8px 12px", display: "flex", justifyContent: "space-between" }}>
+                  <span style={{ fontSize: 12, color: "#94a3b8", fontFamily: "DM Sans" }}>Total Portfolio P&L</span>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: totalPnL >= 0 ? "#34d399" : "#f87171", fontFamily: "DM Mono" }}>
+                    {totalPnL >= 0 ? "+" : ""}{D(totalPnL)} ({totalPnLPct}%)
+                  </span>
+                </div>
+              </Card>
+            )}
+
+            <Card>
+              <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14, fontFamily: "DM Sans" }}>KPI — Conservative vs Actual</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <StatBox label="Conservative Target" value={D(conservative)} sub={thisMonth} color="#64748b" />
+                <StatBox label="Actual NW" value={D(netWorth)} sub="Calculated live" color="#f0b429" />
+              </div>
+              <div style={{ marginTop: 14, textAlign: "center", background: kpiDelta >= 0 ? "#052e16" : "#1f0a0a", border: `1px solid ${kpiDelta >= 0 ? "#065f46" : "#7f1d1d"}`, borderRadius: 10, padding: "12px" }}>
+                <div style={{ fontSize: 24, fontWeight: 700, color: kpiDelta >= 0 ? "#34d399" : "#f87171", fontFamily: "DM Mono" }}>
+                  {kpiDelta >= 0 ? "▲ AHEAD" : "▼ BEHIND"} by {D(Math.abs(kpiDelta))}
+                </div>
+                <div style={{ fontSize: 12, color: "#64748b", fontFamily: "DM Sans", marginTop: 4 }}>
+                  {kpiDelta >= 0 ? `${kpiPct}% above plan 🟢` : `${Math.abs(kpiPct)}% below plan 🔴`}
+                </div>
+              </div>
+            </Card>
+
+            {manual.history && manual.history.length > 1 && (
+              <Card>
+                <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14, fontFamily: "DM Sans" }}>Net Worth History Chart</div>
+                <LineChart
+                  data={sortedHistory.map(h => ({ month: h.date, actual: h.nw, target: h.conservative }))}
+                  keys={["actual", "target"]}
+                  colors={["#f0b429", "#374151"]}
+                  labels={["Actual NW", "Conservative Target"]}
+                  height={130}
+                />
+              </Card>
+            )}
+
+            <Card>
+              <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14, fontFamily: "DM Sans" }}>Monthly Cash Flow (Qatar)</div>
+              {[
+                { label: "Car EMI + Insurance", val: "QAR 7,150", p: "28.6%", color: "#f87171" },
+                { label: "Rent", val: "QAR 4,300", p: "17.2%", color: "#fb923c" },
+                { label: "Domestic Help", val: "QAR 1,200", p: "4.8%", color: "#fbbf24" },
+                { label: "Malabar", val: "QAR 4,200", p: "16.8%", color: "#f0b429" },
+                { label: "Groceries", val: "QAR 2,000", p: "8.0%", color: "#a78bfa" },
+                { label: "Free Cash", val: "QAR 5,950", p: "23.8%", color: "#34d399" },
+              ].map((r, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #0d1525" }}>
+                  <span style={{ fontSize: 11, color: "#94a3b8", fontFamily: "DM Sans" }}>{r.label}</span>
+                  <div style={{ textAlign: "right" }}>
+                    <span style={{ fontSize: 11, color: r.color, fontFamily: "DM Mono" }}>{r.val}</span>
+                    <span style={{ fontSize: 10, color: "#374151", fontFamily: "DM Mono", marginLeft: 8 }}>{r.p}</span>
+                  </div>
+                </div>
+              ))}
+            </Card>
+          </>
+        )}
+
+        {/* ── TAB 6: HISTORY ── */}
+        {tab === 6 && (
+          <>
+            <SectionTitle n="7" title="Parameter History" icon="🗓️" />
+            <div style={{ background: "#0a1228", border: "1px solid #1e3a5f", borderRadius: 10, padding: "10px 14px", marginBottom: 14, fontSize: 11, color: "#38bdf8", fontFamily: "DM Sans" }}>
+              📋 Every column = one save. Scroll right for all dates. Now tracks Principal vs Current for stocks & MF.
+            </div>
+            <Card>
+              <ParamHistoryTable history={manual.history || []} />
+            </Card>
+            {(manual.history || []).length > 1 && (
+              <Card>
+                <div style={{ fontSize: 12, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 14, fontFamily: "DM Sans" }}>Net Worth Trend</div>
+                <LineChart
+                  data={sortedHistory.map(h => ({ month: h.date, nw: h.nw }))}
+                  keys={["nw"]} colors={["#f0b429"]} labels={["Net Worth"]} height={120}
+                />
+              </Card>
+            )}
+          </>
+        )}
+
+
+        {tab === 7 && (
+          <>
+            <SectionTitle n="8" title="GitHub Storage" icon="⚙️" />
+            <div style={{ background: "#0a1228", border: "1px solid #1e3a5f", borderRadius: 10, padding: "10px 14px", marginBottom: 14, fontSize: 11, color: "#38bdf8", fontFamily: "DM Sans" }}>
+              Your wealth data saves to your private GitHub repo — free forever, fully private.
+            </div>
+            <Card>
+              <div style={{ fontSize: 11, color: "#f0b429", textTransform: "uppercase", letterSpacing: 2, marginBottom: 16, fontFamily: "DM Sans" }}>GitHub Credentials</div>
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ display: "block", fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4, fontFamily: "DM Sans" }}>GitHub Username</label>
+                <input type="text" value={ghCfg.user} onChange={e => setGhCfg(p => ({ ...p, user: e.target.value }))} placeholder="your-github-username"
+                  style={{ width: "100%", background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 8, padding: "8px 12px", color: "#e2e8f0", fontSize: 13, fontFamily: "DM Mono", outline: "none" }} />
+              </div>
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ display: "block", fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4, fontFamily: "DM Sans" }}>Private Repo Name</label>
+                <input type="text" value={ghCfg.repo} onChange={e => setGhCfg(p => ({ ...p, repo: e.target.value }))} placeholder="my-wealth-data"
+                  style={{ width: "100%", background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 8, padding: "8px 12px", color: "#e2e8f0", fontSize: 13, fontFamily: "DM Mono", outline: "none" }} />
+              </div>
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: "block", fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4, fontFamily: "DM Sans" }}>Personal Access Token</label>
+                <input type="password" value={ghCfg.token} onChange={e => setGhCfg(p => ({ ...p, token: e.target.value }))} placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                  style={{ width: "100%", background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 8, padding: "8px 12px", color: "#e2e8f0", fontSize: 13, fontFamily: "DM Mono", outline: "none" }} />
+                <div style={{ fontSize: 9, color: "#374151", marginTop: 4, fontFamily: "DM Sans" }}>GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) → tick repo</div>
+              </div>
+              <button onClick={() => { saveGhCfg(ghCfg); setGhStatus("Config saved!"); }}
+                style={{ background: "linear-gradient(135deg,#1e3a5f,#0f2040)", border: "1px solid #2d4a6e", borderRadius: 10, padding: "10px 20px", color: "#f0b429", fontFamily: "DM Sans", fontWeight: 700, fontSize: 13, cursor: "pointer", width: "100%", marginBottom: 10 }}>
+                Save Config
+              </button>
+              <button onClick={loadFromGitHub} disabled={ghLoading}
+                style={{ background: "linear-gradient(135deg,#052e16,#064e3b)", border: "1px solid #065f46", borderRadius: 10, padding: "10px 20px", color: "#34d399", fontFamily: "DM Sans", fontWeight: 700, fontSize: 13, cursor: "pointer", width: "100%", marginBottom: 10, opacity: ghLoading ? 0.6 : 1 }}>
+                {ghLoading ? "Loading..." : "Load Data from GitHub"}
+              </button>
+              {ghStatus && (
+                <div style={{ background: "#0d1525", border: "1px solid #1e2d45", borderRadius: 8, padding: "8px 12px", fontSize: 11, color: ghStatus.includes("failed") || ghStatus.includes("error") ? "#f87171" : "#34d399", fontFamily: "DM Mono" }}>
+                  {ghStatus}
+                </div>
+              )}
+            </Card>
+            <Card>
+              <div style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: 2, marginBottom: 12, fontFamily: "DM Sans" }}>Setup Steps</div>
+              {["Create a free private repo on GitHub named my-wealth-data", "Inside the repo create a file called wealth_data.json with content {}", "Generate a Personal Access Token with repo scope — no expiry", "Enter details above and click Save Config", "Click Load Data from GitHub to restore your data on any device", "Every Save in Update tab auto-pushes to GitHub"].map((s, i) => (
+                <div key={i} style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+                  <div style={{ width: 18, height: 18, borderRadius: "50%", background: "#1e3a5f", border: "1px solid #2d4a6e", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, color: "#f0b429", fontFamily: "DM Mono", flexShrink: 0, marginTop: 1 }}>{i+1}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8", fontFamily: "DM Sans", lineHeight: 1.5 }}>{s}</div>
+                </div>
+              ))}
+            </Card>
+          </>
+        )}
+        <div style={{ textAlign: "center", padding: "20px 0 8px", fontSize: 9, color: "#1e2d45", fontFamily: "DM Mono" }}>
+          SABARNA · DBG WEALTH TRACKER · {new Date().getFullYear()} · PRIVATE & CONFIDENTIAL
+        </div>
+      </div>
+    </>
+  );
+}
+
+
+const domRoot = ReactDOM.createRoot(document.getElementById("root"));
+domRoot.render(React.createElement(Dashboard));
+</script>
+</body>
+</html>
