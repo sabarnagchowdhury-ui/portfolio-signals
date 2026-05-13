@@ -2570,35 +2570,73 @@ function _weeklyCloses(data) {
 }
 
 // ── Fetch historical OHLCV from stooq ──
+// Parse Yahoo Finance v8 chart JSON → [{date,open,high,low,close,volume}]
+function _parseYahooChart(d) {
+  const res = d?.chart?.result?.[0];
+  if (!res) return null;
+  const ts   = res.timestamp || [];
+  const q    = res.indicators?.quote?.[0] || {};
+  const rows = [];
+  for (let i=0;i<ts.length;i++){
+    const c = q.close?.[i];
+    if (c==null||isNaN(c)||c<=0) continue;
+    const dt = new Date(ts[i]*1000);
+    const date = dt.toISOString().slice(0,10);
+    rows.push({date, open:q.open?.[i]||c, high:q.high?.[i]||c,
+               low:q.low?.[i]||c, close:c, volume:q.volume?.[i]||0});
+  }
+  return rows.length>=50 ? rows : null;
+}
+
 async function _fetchHist(sym) {
   if (SIG_HIST[sym]) return SIG_HIST[sym];
-  const stooqSym = sym==='SPY' ? 'spy.us' :
-                   sym.startsWith('^') ? sym.slice(1).toLowerCase()+'.us' :
-                   sym.includes('.')||sym.includes(' ') ? null :
-                   sym.toLowerCase()+'.us';
-  if (!stooqSym) return null;
+  if (sym.includes(' ')) return null;
 
-  const url = `https://stooq.com/q/d/l/?s=${stooqSym}&i=d`;
+  // ── Source 1: Yahoo Finance chart API (direct, no proxy needed on most browsers) ──
+  const yhUrls = [
+    `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=2y`,
+    `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=2y`,
+  ];
+  for (const url of yhUrls) {
+    try {
+      const r = await fetch(url, {signal:AbortSignal.timeout(8000), headers:{'Accept':'application/json'}});
+      if (r.ok) {
+        const d = await r.json();
+        const rows = _parseYahooChart(d);
+        if (rows) { SIG_HIST[sym]=rows; return rows; }
+      }
+    } catch(e){}
+  }
 
+  // ── Source 2: Yahoo Finance via CORS proxy ──
   for (const proxyFn of CORS_PROXIES) {
     try {
-      const r = await fetch(proxyFn(url), {signal:AbortSignal.timeout(14000)});
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=2y`;
+      const r = await fetch(proxyFn(url), {signal:AbortSignal.timeout(12000)});
+      if (!r.ok) continue;
+      const d = await r.json();
+      const rows = _parseYahooChart(d);
+      if (rows) { SIG_HIST[sym]=rows; return rows; }
+    } catch(e){}
+  }
+
+  // ── Source 3: Stooq historical (fallback) ──
+  const stooqSym = sym==='SPY'?'spy.us':sym.startsWith('^')?sym.slice(1).toLowerCase()+'.us':sym.toLowerCase()+'.us';
+  for (const proxyFn of CORS_PROXIES) {
+    try {
+      const url = `https://stooq.com/q/d/l/?s=${stooqSym}&i=d`;
+      const r = await fetch(proxyFn(url), {signal:AbortSignal.timeout(12000)});
       if (!r.ok) continue;
       const txt = await r.text();
-      if (!txt || txt.includes('No data') || txt.length < 200) continue;
+      if (!txt||txt.includes('No data')||txt.length<200) continue;
       const lines = txt.trim().split('\n');
-      if (lines.length < 20) continue;
-      const rows = [];
+      const rows=[];
       for (let i=1;i<lines.length;i++){
-        const [date,open,high,low,close,volume] = lines[i].split(',');
+        const [date,open,high,low,close,volume]=lines[i].split(',');
         const c=parseFloat(close);
-        if (!isNaN(c)&&c>0) rows.push({date,open:+open,high:+high,low:+low,close:c,volume:parseFloat(volume)||0});
+        if(!isNaN(c)&&c>0) rows.push({date,open:+open,high:+high,low:+low,close:c,volume:parseFloat(volume)||0});
       }
-      if (rows.length>=50){
-        const result = rows.slice(-400); // keep last ~400 trading days (~1.6yr)
-        SIG_HIST[sym] = result;
-        return result;
-      }
+      if (rows.length>=50){ SIG_HIST[sym]=rows.slice(-400); return SIG_HIST[sym]; }
     } catch(e){}
   }
   return null;
