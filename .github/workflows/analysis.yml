@@ -1,0 +1,55 @@
+# .github/workflows/analysis.yml
+# ══════════════════════════════════════════════════════════
+#  Portfolio Signal Analysis — runs weekly + on-demand
+#  Scores US holdings → data/processed/stock_analysis.json
+#  Commit the JSON so the dashboard can fetch it as raw URL
+# ══════════════════════════════════════════════════════════
+
+name: Portfolio Signal Analysis
+
+on:
+  schedule:
+    # Every Monday at 14:00 UTC (9am New York) — after US market open
+    - cron: '0 14 * * 1'
+  workflow_dispatch:
+    inputs:
+      extra_tickers:
+        description: 'Optional extra tickers to screen (space-separated, e.g. "TSLA NVDA")'
+        required: false
+        default: ''
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write    # needed to commit the JSON output
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy --quiet
+
+      - name: Run signal analysis
+        run: |
+          python scripts/analyse_holdings.py ${{ github.event.inputs.extra_tickers }}
+
+      - name: Commit updated analysis
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/processed/stock_analysis.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: weekly signal analysis $(date -u +%Y-%m-%d)"
+            git push
+          fi
